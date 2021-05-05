@@ -1,0 +1,114 @@
+#!/bin/sh
+
+if git rev-parse --verify HEAD >/dev/null 2>&1
+then
+	against=HEAD
+else
+	# Initial commit: diff against an empty tree object
+	against=`git hash-object -t tree /dev/null`
+fi
+
+phpfiles=`git diff --name-only --diff-filter=d $against | grep \.php`
+if [ "$phpfiles" != "" ]; then
+
+    echo '####\033[32m check phpstan \033[m####'
+    echo '####\033[32m check php-cs-fixer \033[m####'
+    echo '####\033[32m check php -l \033[m####'
+    echo
+
+    # ディレクトリ定義
+    ROOT_DIR=`git rev-parse --show-toplevel`
+
+    # エラー定義
+    errorStan=false
+    errorCs=false
+    errorL=false
+    for file in `git diff-index --name-status $against -- | grep -E '^[AUM].*\.php$'| cut -c3-`
+    do
+        # phpstan実行 全ファイルにチェックすると既存ファイルにエラーがある時コミットできないので、コミット対象のファイルのみチェックする
+        phpstanCheck=`./vendor/bin/phpstan analyze --memory-limit=2G $ROOT_DIR/$file`
+        # エラーがなければ'No errors'という文字列があるので、それがない場合にエラーと判断
+        echo $phpstanCheck | grep 'No errors' > /dev/null 2>&1
+        # $?には直前の実行結果が入る
+        if [ $? != 0 ]; then
+            echo "####\033[31m　phpstan failed!!!! \033[m####$phpstanCheck\n"
+            errorStan=true
+        else
+            # php -lによるシンタックスチェック実行 app/配下以外だとphpstanが実行されない気がする？為入れてる
+            syntaxCheck=`php -l $file`
+            # エラーがなければ'No syntax errors'という文字列があるので、それがない場合にエラーと判断
+            echo $syntaxCheck | grep 'No syntax errors' > /dev/null 2>&1
+            if [ $? != 0 ]; then
+                # シンタックスエラーのあった場合はエラー内容を出力
+                echo "####\033[31m php -l failed!!!! \033[m####$syntaxCheck\n"
+                errorL=true
+            fi
+        fi
+
+        # php-cs-fixer実行 --dry-run で修正はせずに引っ掛かったらコミットさせずに修正を促す
+        # --path-modeをintersectionにすることで、Finderが無視されないようにする
+        .tools/php-cs-fixer/vendor/bin/php-cs-fixer fix --path-mode=intersection --dry-run $ROOT_DIR/$file > /dev/null 2>&1
+        if [ $? != 0 ]; then
+            echo "####\033[31m php-cs-fixer failed!!!! \033[m####\n $ROOT_DIR/$file\n"
+            errorCs=true
+        fi
+    done
+
+    # "phpstan", "php-cs-fixer", "php -l"のどれかに引っ掛かっていたらコミットを中断
+    if "${errorStan}"; then
+        echo "####\033[31m　Commit fail\033[m please fix \033[31mphpstan errors\033[m ####"
+    fi
+    if "${errorL}"; then
+        echo "####\033[31m　Commit fail\033[m please \033[31msyntax check\033[m ####"
+    fi
+    if "${errorCs}"; then
+        echo "####\033[31m　Commit fail\033[m please run \033[31m\"tools/php-cs-fixer/vendor/bin/php-cs-fixer fix\"\033[m command ####"
+    fi
+    if [ $errorStan -o $errorL -o $errorCs ]; then
+        exit 1
+    fi
+
+    echo '####\033[32m phpstan, php -l, php-cs-fixer all completed!! \033[m####'
+
+fi
+
+# この下はほぼ`git init`で生成されたデフォルトのまま
+
+# If you want to allow non-ASCII filenames set this variable to true.
+allownonascii=$(git config --bool hooks.allownonascii)
+
+# Redirect output to stderr.
+exec 1>&2
+
+# Cross platform projects tend to avoid non-ASCII filenames; prevent
+# them from being added to the repository. We exploit the fact that the
+# printable range starts at the space character and ends with tilde.
+if [ "$allownonascii" != "true" ] &&
+	# Note that the use of brackets around a tr range is ok here, (it's
+	# even required, for portability to Solaris 10's /usr/bin/tr), since
+	# the square bracket bytes happen to fall in the designated range.
+	test $(git diff --cached --name-only --diff-filter=A -z $against |
+	  LC_ALL=C tr -d '[ -~]\0' | wc -c) != 0
+then
+
+    echo "####\033[31m ここでエラーの場合はコミットしたファイルに空白行に余分なスペースがある可能性があります。\033[m ####
+####\033[31m もしどうしても解決できない場合は'git commit -m \"commit message\" --no-verify'でprecommitを無効化させてください。(非推奨) \033[m ####"
+
+	cat <<\EOF
+####
+Error: Attempt to add a non-ASCII file name.
+
+This can cause problems if you want to work with people on other platforms.
+
+To be portable it is advisable to rename the file.
+
+If you know what you are doing you can disable this check using:
+
+  git config hooks.allownonascii true
+####
+EOF
+	exit 1
+fi
+
+# If there are whitespace errors, print the offending file names and fail.
+exec git diff-index --check --cached $against --
